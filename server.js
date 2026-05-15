@@ -22,18 +22,17 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Store active users and their groups
-const activeUsers = new Map(); // username -> socketId
-const userGroups = new Map(); // username -> groupId
+// Store active users
+const activeUsers = new Map();
+const userSockets = new Map(); // socketId -> username
 
-// ==================== AUTH API ====================
+// ==================== API ROUTES ====================
 
 // Register
 app.post('/api/register', async (req, res) => {
     const { username, password, motherName, fatherName, gender } = req.body;
     
     try {
-        // Check if user exists
         const { data: existing } = await supabase
             .from('users')
             .select('username')
@@ -98,7 +97,7 @@ app.post('/api/login', async (req, res) => {
 // User exists check
 app.get('/user-exists', async (req, res) => {
     const { username } = req.query;
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('users')
         .select('username')
         .eq('username', username)
@@ -110,7 +109,7 @@ app.get('/user-exists', async (req, res) => {
 // Get user gender
 app.get('/api/user-gender', async (req, res) => {
     const { username } = req.query;
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('users')
         .select('gender')
         .eq('username', username)
@@ -138,7 +137,7 @@ app.post('/api/update-gender', async (req, res) => {
 app.post('/api/forgot-password', async (req, res) => {
     const { username, motherName, fatherName, newPassword } = req.body;
     
-    const { data: user, error } = await supabase
+    const { data: user } = await supabase
         .from('users')
         .select('*')
         .eq('username', username)
@@ -154,11 +153,10 @@ app.post('/api/forgot-password', async (req, res) => {
     res.json({ success: true });
 });
 
-// ==================== PROFILE PIC ====================
-
+// Profile pic
 app.get('/api/get-pic', async (req, res) => {
     const { username } = req.query;
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('users')
         .select('profile_pic')
         .eq('username', username)
@@ -174,33 +172,13 @@ app.post('/api/upload-pic', async (req, res) => {
         .update({ profile_pic: imageData })
         .eq('username', username);
     
-    if (error) {
-        res.json({ success: false });
-    } else {
-        // Notify friends about profile pic update
-        const { data: friends } = await supabase
-            .from('friends')
-            .select('user1, user2')
-            .or(`user1.eq.${username},user2.eq.${username}`);
-        
-        if (friends) {
-            friends.forEach(f => {
-                const friend = f.user1 === username ? f.user2 : f.user1;
-                const socketId = activeUsers.get(friend);
-                if (socketId) {
-                    io.to(socketId).emit('profile-pic-updated', { userId: username, imageData });
-                }
-            });
-        }
-        res.json({ success: true });
-    }
+    res.json({ success: !error });
 });
 
-// ==================== FRIENDS API ====================
-
+// Friends
 app.get('/api/friends', async (req, res) => {
     const { username } = req.query;
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('friends')
         .select('user1, user2')
         .or(`user1.eq.${username},user2.eq.${username}`);
@@ -211,7 +189,7 @@ app.get('/api/friends', async (req, res) => {
 
 app.get('/api/friend-requests', async (req, res) => {
     const { username } = req.query;
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('friend_requests')
         .select('from_user')
         .eq('to_user', username)
@@ -223,7 +201,6 @@ app.get('/api/friend-requests', async (req, res) => {
 app.post('/api/send-friend-request', async (req, res) => {
     const { from, to } = req.body;
     
-    // Check if already friends
     const { data: existingFriend } = await supabase
         .from('friends')
         .select('*')
@@ -234,22 +211,8 @@ app.post('/api/send-friend-request', async (req, res) => {
         return res.json({ success: false, message: "Already friends" });
     }
     
-    // Check if request already exists
-    const { data: existingRequest } = await supabase
-        .from('friend_requests')
-        .select('*')
-        .eq('from_user', from)
-        .eq('to_user', to)
-        .eq('status', 'pending')
-        .single();
-    
-    if (existingRequest) {
-        return res.json({ success: false, message: "Request already sent" });
-    }
-    
     await supabase.from('friend_requests').insert([{ from_user: from, to_user: to }]);
     
-    // Notify if online
     const toSocketId = activeUsers.get(to);
     if (toSocketId) {
         io.to(toSocketId).emit('friend-request', { from });
@@ -260,10 +223,8 @@ app.post('/api/send-friend-request', async (req, res) => {
 
 app.post('/api/accept-friend', async (req, res) => {
     const { from, to } = req.body;
-    
     await supabase.from('friend_requests').delete().eq('from_user', from).eq('to_user', to);
     await supabase.from('friends').insert([{ user1: from, user2: to }]);
-    
     res.json({ success: true });
 });
 
@@ -282,12 +243,11 @@ app.post('/api/remove-friend', async (req, res) => {
     res.json({ success: true });
 });
 
-// ==================== PRIVATE MESSAGES API ====================
-
+// Private messages
 app.get('/api/private-messages', async (req, res) => {
     const { user1, user2, limit = 20, offset = 0 } = req.query;
     
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('private_messages')
         .select('*')
         .or(`and(from_user.eq.${user1},to_user.eq.${user2}),and(from_user.eq.${user2},to_user.eq.${user1})`)
@@ -300,23 +260,20 @@ app.get('/api/private-messages', async (req, res) => {
 
 app.post('/api/send-private-message', async (req, res) => {
     const { from, to, text, time } = req.body;
-    
     await supabase.from('private_messages').insert([{
         from_user: from,
         to_user: to,
         text,
         time
     }]);
-    
     res.json({ success: true });
 });
 
-// ==================== GROUP MESSAGES API ====================
-
+// Group messages
 app.get('/api/group-messages', async (req, res) => {
     const { groupId, limit = 25, offset = 0 } = req.query;
     
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('group_messages')
         .select('*')
         .eq('group_id', groupId)
@@ -328,92 +285,103 @@ app.get('/api/group-messages', async (req, res) => {
 });
 
 // ==================== SOCKET.IO ====================
-
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    console.log('Socket connected:', socket.id);
     
     socket.on('register-user', async ({ username }) => {
         activeUsers.set(username, socket.id);
-        console.log(`${username} registered`);
+        userSockets.set(socket.id, username);
+        console.log(`${username} registered, online: ${activeUsers.size}`);
         
-        // Get user's groups
-        const { data: groups } = await supabase
-            .from('group_members')
-            .select('group_id')
-            .eq('username', username);
-        
-        if (groups) {
-            groups.forEach(g => {
-                userGroups.set(username, g.group_id);
-                socket.join(g.group_id);
-            });
-        }
-        
-        // Send online users list to all
+        // Send online users list to everyone
         const onlineList = Array.from(activeUsers.keys());
         io.emit('online-users', onlineList);
     });
     
     socket.on('create-group', async ({ userId }) => {
-        const groupId = Math.random().toString(36).substring(2, 10);
+        const groupId = Math.random().toString(36).substring(2, 10).toUpperCase();
+        console.log(`Creating group: ${groupId} by ${userId}`);
         
         await supabase.from('groups').insert([{ group_id: groupId, created_by: userId }]);
         await supabase.from('group_members').insert([{ group_id: groupId, username: userId }]);
         
-        userGroups.set(userId, groupId);
         socket.join(groupId);
         socket.emit('group-created', groupId);
         socket.emit('admin-status', true);
+        
+        // Update user's group in memory
+        socket.data.currentGroup = groupId;
     });
     
     socket.on('join-group', async ({ groupId, userId }) => {
+        console.log(`Join group request: ${userId} -> ${groupId}`);
+        
         const { data: group } = await supabase
             .from('groups')
-            .select('group_id')
+            .select('group_id, created_by')
             .eq('group_id', groupId)
             .single();
         
-        if (group) {
-            await supabase.from('group_members').insert([{ group_id: groupId, username: userId }]);
-            userGroups.set(userId, groupId);
-            socket.join(groupId);
-            socket.emit('joined-group', groupId);
-            
-            // Check if user is admin
-            const isAdmin = group.created_by === userId;
-            socket.emit('admin-status', isAdmin);
-            
-            // Send old messages
-            const { data: messages } = await supabase
-                .from('group_messages')
-                .select('*')
-                .eq('group_id', groupId)
-                .order('created_at', { ascending: true })
-                .limit(50);
-            
-            socket.emit('old-messages', messages || []);
-        } else {
+        if (!group) {
             socket.emit('error', 'Group not found');
+            return;
         }
-    });
-    
-    socket.on('rejoin-group', async ({ groupId, userId }) => {
-        socket.join(groupId);
-        userGroups.set(userId, groupId);
         
-        // Send only online users, not old messages (prevents auto load)
+        // Check if already member
+        const { data: existing } = await supabase
+            .from('group_members')
+            .select('*')
+            .eq('group_id', groupId)
+            .eq('username', userId)
+            .single();
+        
+        if (!existing) {
+            await supabase.from('group_members').insert([{ group_id: groupId, username: userId }]);
+        }
+        
+        socket.join(groupId);
+        socket.emit('joined-group', groupId);
+        socket.emit('admin-status', group.created_by === userId);
+        socket.data.currentGroup = groupId;
+        
+        // Send old messages to this socket only
+        const { data: messages } = await supabase
+            .from('group_messages')
+            .select('*')
+            .eq('group_id', groupId)
+            .order('created_at', { ascending: true })
+            .limit(50);
+        
+        socket.emit('old-messages', messages || []);
+        
+        // Update online users for everyone
         const onlineList = Array.from(activeUsers.keys());
         io.emit('online-users', onlineList);
     });
     
+    socket.on('rejoin-group', async ({ groupId, userId }) => {
+        if (groupId) {
+            socket.join(groupId);
+            socket.data.currentGroup = groupId;
+            
+            // Send only online users, not old messages
+            const onlineList = Array.from(activeUsers.keys());
+            io.emit('online-users', onlineList);
+        }
+    });
+    
     socket.on('send-message', async ({ groupId, msg }) => {
+        console.log(`Send message to group ${groupId}:`, msg);
+        
+        // Store in database
         await supabase.from('group_messages').insert([{
             group_id: groupId,
-            user: msg.user,
+            username: msg.user,
             text: msg.text,
             time: msg.time
         }]);
         
+        // Broadcast to everyone in the group including sender
         io.to(groupId).emit('new-message', msg);
     });
     
@@ -424,13 +392,17 @@ io.on('connection', (socket) => {
     socket.on('leave-group', async ({ groupId, userId }) => {
         await supabase.from('group_members').delete().eq('group_id', groupId).eq('username', userId);
         socket.leave(groupId);
-        if (userGroups.get(userId) === groupId) {
-            userGroups.delete(userId);
+        if (socket.data.currentGroup === groupId) {
+            delete socket.data.currentGroup;
         }
     });
     
     socket.on('close-group', async ({ groupId, userId }) => {
-        const { data: group } = await supabase.from('groups').select('created_by').eq('group_id', groupId).single();
+        const { data: group } = await supabase
+            .from('groups')
+            .select('created_by')
+            .eq('group_id', groupId)
+            .single();
         
         if (group && group.created_by === userId) {
             await supabase.from('group_members').delete().eq('group_id', groupId);
@@ -449,21 +421,18 @@ io.on('connection', (socket) => {
     });
     
     socket.on('disconnect', () => {
-        let disconnectedUser = null;
-        for (let [user, id] of activeUsers.entries()) {
-            if (id === socket.id) {
-                disconnectedUser = user;
-                activeUsers.delete(user);
-                break;
-            }
+        const username = userSockets.get(socket.id);
+        if (username) {
+            activeUsers.delete(username);
+            userSockets.delete(socket.id);
+            console.log(`${username} disconnected`);
+            
+            const onlineList = Array.from(activeUsers.keys());
+            io.emit('online-users', onlineList);
         }
-        const onlineList = Array.from(activeUsers.keys());
-        io.emit('online-users', onlineList);
-        console.log('User disconnected:', disconnectedUser);
     });
 });
 
-// ==================== START SERVER ====================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
