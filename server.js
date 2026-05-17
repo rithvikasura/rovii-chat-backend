@@ -24,7 +24,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Store active users
 const activeUsers = new Map();
-const userSockets = new Map(); // socketId -> username
+const userSockets = new Map();
 
 // ==================== API ROUTES ====================
 
@@ -245,7 +245,7 @@ app.post('/api/remove-friend', async (req, res) => {
 
 // Private messages
 app.get('/api/private-messages', async (req, res) => {
-    const { user1, user2, limit = 20, offset = 0 } = req.query;
+    const { user1, user2, limit = 100, offset = 0 } = req.query;
     
     const { data } = await supabase
         .from('private_messages')
@@ -271,7 +271,7 @@ app.post('/api/send-private-message', async (req, res) => {
 
 // Group messages
 app.get('/api/group-messages', async (req, res) => {
-    const { groupId, limit = 25, offset = 0 } = req.query;
+    const { groupId, limit = 100, offset = 0 } = req.query;
     
     const { data } = await supabase
         .from('group_messages')
@@ -293,7 +293,6 @@ io.on('connection', (socket) => {
         userSockets.set(socket.id, username);
         console.log(`${username} registered, online: ${activeUsers.size}`);
         
-        // Send online users list to everyone
         const onlineList = Array.from(activeUsers.keys());
         io.emit('online-users', onlineList);
     });
@@ -308,8 +307,6 @@ io.on('connection', (socket) => {
         socket.join(groupId);
         socket.emit('group-created', groupId);
         socket.emit('admin-status', true);
-        
-        // Update user's group in memory
         socket.data.currentGroup = groupId;
     });
     
@@ -327,7 +324,6 @@ io.on('connection', (socket) => {
             return;
         }
         
-        // Check if already member
         const { data: existing } = await supabase
             .from('group_members')
             .select('*')
@@ -344,17 +340,15 @@ io.on('connection', (socket) => {
         socket.emit('admin-status', group.created_by === userId);
         socket.data.currentGroup = groupId;
         
-        // Send old messages to this socket only
         const { data: messages } = await supabase
             .from('group_messages')
             .select('*')
             .eq('group_id', groupId)
             .order('created_at', { ascending: true })
-            .limit(50);
+            .limit(100);
         
         socket.emit('old-messages', messages || []);
         
-        // Update online users for everyone
         const onlineList = Array.from(activeUsers.keys());
         io.emit('online-users', onlineList);
     });
@@ -363,8 +357,6 @@ io.on('connection', (socket) => {
         if (groupId) {
             socket.join(groupId);
             socket.data.currentGroup = groupId;
-            
-            // Send only online users, not old messages
             const onlineList = Array.from(activeUsers.keys());
             io.emit('online-users', onlineList);
         }
@@ -373,7 +365,6 @@ io.on('connection', (socket) => {
     socket.on('send-message', async ({ groupId, msg }) => {
         console.log(`Send message to group ${groupId}:`, msg);
         
-        // Store in database
         await supabase.from('group_messages').insert([{
             group_id: groupId,
             username: msg.user,
@@ -381,7 +372,6 @@ io.on('connection', (socket) => {
             time: msg.time
         }]);
         
-        // Broadcast to everyone in the group including sender
         io.to(groupId).emit('new-message', msg);
     });
     
@@ -389,15 +379,20 @@ io.on('connection', (socket) => {
         io.to(groupId).emit('sync-video', { videoId });
     });
     
+    // ✅ FIXED: Leave group
     socket.on('leave-group', async ({ groupId, userId }) => {
+        console.log(`User ${userId} leaving group ${groupId}`);
         await supabase.from('group_members').delete().eq('group_id', groupId).eq('username', userId);
         socket.leave(groupId);
+        socket.emit('left-group', { groupId });
         if (socket.data.currentGroup === groupId) {
             delete socket.data.currentGroup;
         }
     });
     
+    // ✅ FIXED: Close group
     socket.on('close-group', async ({ groupId, userId }) => {
+        console.log(`User ${userId} trying to close group ${groupId}`);
         const { data: group } = await supabase
             .from('groups')
             .select('created_by')
@@ -408,8 +403,10 @@ io.on('connection', (socket) => {
             await supabase.from('group_members').delete().eq('group_id', groupId);
             await supabase.from('group_messages').delete().eq('group_id', groupId);
             await supabase.from('groups').delete().eq('group_id', groupId);
-            
             io.to(groupId).emit('group-closed');
+            console.log(`Group ${groupId} closed by admin ${userId}`);
+        } else {
+            socket.emit('error', 'Not authorized to close this group');
         }
     });
     
